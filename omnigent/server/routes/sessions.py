@@ -123,7 +123,9 @@ from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runtime import (
     get_agent_cache,
+    get_artifact_store,
     get_caps,
+    get_file_store,
     get_policy_store,
     inflight_text,
     pending_elicitations,
@@ -943,6 +945,32 @@ _SERVER_STREAM_EVENT_ADAPTER: TypeAdapter[ServerStreamEvent] = TypeAdapter(Serve
 # it finishes (the well-known RUF006 / Python ``asyncio`` footgun).
 # Entries are evicted by a done-callback on the task itself.
 _WATCHER_TASKS: set[asyncio.Task[None]] = set()
+
+# Strong references and bounded in-flight guards for asynchronous title
+# generation. First-turn dispatch does not wait for history lookup or the model.
+_session_title_tasks: set[asyncio.Task[None]] = set()
+_session_title_inflight_ids: set[str] = set()
+_SESSION_TITLE_GENERATION_ATTEMPTS = 3
+_SESSION_TITLE_RETRY_DELAY_SECONDS = 1.0
+# Do not impose a runtime deadline on background title generation. This bound
+# applies only while the server itself is shutting down.
+_SESSION_TITLE_SHUTDOWN_TIMEOUT_SECONDS = 6.0
+
+
+async def cancel_session_title_tasks() -> None:
+    """Give title refinements bounded time to persist before cancellation."""
+    tasks = list(_session_title_tasks)
+    if not tasks:
+        return
+    _, pending = await asyncio.wait(
+        tasks,
+        timeout=_SESSION_TITLE_SHUTDOWN_TIMEOUT_SECONDS,
+    )
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.sleep(0)
+
 
 # Per-session status cache updated by the runner SSE relay.
 # Used by _get_session_snapshot.
@@ -5341,12 +5369,17 @@ async def _persist_external_conversation_item(
     for skipped in skipped_kiro_pending:
         await _persist_skipped_kiro_pending_input(
             session_id,
+            conv,
             skipped,
             conversation_store,
         )
     persisted_items = await asyncio.to_thread(conversation_store.append, session_id, [item])
-    await _seed_missing_title_from_user_message(conv, item, conversation_store)
     persisted = persisted_items[0]
+    await _seed_missing_title_from_user_message(
+        conv,
+        item,
+        conversation_store,
+    )
     _publish_external_conversation_item(
         session_id, persisted, cleared_pending_id=cleared_pending_id
     )
@@ -5361,6 +5394,7 @@ def _is_kiro_native_session(conv: Conversation) -> bool:
 
 async def _persist_skipped_kiro_pending_input(
     session_id: str,
+    conv: Conversation,
     skipped: pending_inputs.DrainedInput,
     conversation_store: ConversationStore,
 ) -> None:
@@ -5387,6 +5421,11 @@ async def _persist_skipped_kiro_pending_input(
             user_item,
             NewConversationItem(type="error", response_id=turn_id, data=error),
         ],
+    )
+    await _seed_missing_title_from_user_message(
+        conv,
+        user_item,
+        conversation_store,
     )
     _publish_input_consumed(
         session_id,
@@ -8223,7 +8262,11 @@ async def _persist_host_launch_failure_turn(
         session_id,
         [user_item],
     )
-    await _seed_missing_title_from_user_message(conv, user_item, conversation_store)
+    await _seed_missing_title_from_user_message(
+        conv,
+        user_item,
+        conversation_store,
+    )
     error_persist_result = await _relay_persist_error_once(
         conversation_store,
         session_id,
@@ -9052,10 +9095,8 @@ async def _dispatch_skill_slash_command_to_runner(
     # otherwise keep a NULL title and the sidebar falls back to the
     # conversation id. Titled from the typed command ("/debate kafka…"),
     # NOT the hidden meta item — that's the full SKILL.md instruction blob.
-    command_text = f"/{skill_name} {arguments}" if arguments else f"/{skill_name}"
     await _seed_missing_title(
         conv,
-        [{"type": "input_text", "text": command_text}],
         conversation_store,
     )
 
@@ -9104,7 +9145,9 @@ async def _dispatch_skill_slash_command_to_runner(
     return visible.id
 
 
-def _title_content_from_item(item: NewConversationItem) -> list[dict[str, Any]]:
+def _title_content_from_item(
+    item: NewConversationItem | ConversationItem,
+) -> list[dict[str, Any]]:
     """
     Extract title candidate content blocks from a session item.
 
@@ -9137,41 +9180,229 @@ def _title_content_from_item(item: NewConversationItem) -> list[dict[str, Any]]:
         return []
     if not isinstance(item.data, MessageData):
         return []
-    if item.data.role != "user":
+    if item.data.role != "user" or item.data.is_meta:
         return []
     return item.data.content
 
 
+def _is_title_source_item(item: NewConversationItem | ConversationItem) -> bool:
+    """Return whether an item counts as the session's first user request."""
+    if item.type == _SLASH_COMMAND_TYPE:
+        return isinstance(item.data, SlashCommandData) and item.data.kind == "skill"
+    return (
+        item.type == "message"
+        and isinstance(item.data, MessageData)
+        and item.data.role == "user"
+        and not item.data.is_meta
+    )
+
+
+@dataclass(frozen=True)
+class _TitleCandidate:
+    """Resolved inputs for one title-generation attempt."""
+
+    prompt: str | None
+    fallback_title: str | None
+    attachments: tuple[dict[str, Any], ...]
+
+
+def _title_attachments(
+    content: list[dict[str, Any]],
+    conversation_id: str,
+    file_store: FileStore | None,
+    artifact_store: ArtifactStore | None,
+) -> tuple[dict[str, Any], ...]:
+    """Resolve title-candidate attachment blocks for the title model."""
+    from omnigent.runtime.content_resolver import _resolve_message_content
+
+    attachments: list[dict[str, Any]] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") not in {
+            "input_image",
+            "input_file",
+        }:
+            continue
+        resolved = block
+        if "file_id" in block:
+            if file_store is None or artifact_store is None:
+                continue
+            try:
+                resolved = _resolve_message_content(
+                    [block],
+                    file_store,
+                    artifact_store,
+                    session_id=conversation_id,
+                )[0]
+            except (KeyError, ValueError):
+                _logger.warning(
+                    "Session title image resolution failed for session=%s",
+                    conversation_id,
+                    exc_info=True,
+                )
+                continue
+        if resolved.get("type") == "input_image":
+            image_url = resolved.get("image_url")
+            if isinstance(image_url, str) and image_url:
+                attachments.append(resolved)
+        else:
+            file_data = resolved.get("file_data")
+            if isinstance(file_data, str) and file_data:
+                attachments.append(resolved)
+    return tuple(attachments)
+
+
+def _first_title_candidate(
+    conversation_store: ConversationStore,
+    conversation_id: str,
+    *,
+    include_images: bool,
+) -> _TitleCandidate | None:
+    """Return the oldest persisted request usable by the title strategy."""
+    after: str | None = None
+    file_store = get_file_store() if include_images else None
+    artifact_store = get_artifact_store() if include_images else None
+    while True:
+        page = conversation_store.list_items(
+            conversation_id,
+            limit=100,
+            after=after,
+            order="asc",
+        )
+        for item in page.data:
+            if not _is_title_source_item(item):
+                continue
+            content = _title_content_from_item(item)
+            prompt = synthesize_conversation_title(content, limit=4000)
+            fallback_title = synthesize_conversation_title(content)
+            attachments = (
+                _title_attachments(
+                    content,
+                    conversation_id,
+                    file_store,
+                    artifact_store,
+                )
+                if include_images
+                else ()
+            )
+            if prompt is not None or attachments:
+                return _TitleCandidate(
+                    prompt=prompt,
+                    fallback_title=fallback_title,
+                    attachments=attachments,
+                )
+        if not page.has_more or page.last_id is None:
+            return None
+        after = page.last_id
+
+
 async def _seed_missing_title(
     conv: Conversation,
-    content: list[dict[str, Any]],
     conversation_store: ConversationStore,
 ) -> None:
     """
-    Set an untitled conversation's title from message content blocks.
+    Name an untitled conversation from its oldest persisted user request.
 
-    No-op when the conversation already has a title or the blocks
-    yield no usable text. Mutates ``conv.title`` in place on success
-    so callers holding the row see the persisted value.
+    Without a configured generator, the original prompt-derived title is
+    persisted before returning. With a generator, refinement runs in the
+    background and the session stays untitled until the model returns a valid
+    title. Generation is attempted a few times before falling back to the
+    original prompt-derived title. Any title is set only if the conversation is
+    still untitled.
 
     :param conv: The conversation row for the session.
-    :param content: Title-candidate blocks, e.g.
-        ``[{"type": "input_text", "text": "/debate kafka vs sqs"}]``.
     :param conversation_store: Store used to persist the title.
     :returns: None.
     """
     if conv.title is not None:
         return
-    title = synthesize_conversation_title(content)
-    if title is None:
+    generator = get_caps().session_title_generator
+
+    if generator is None:
+        try:
+            candidate = await asyncio.to_thread(
+                _first_title_candidate,
+                conversation_store,
+                conv.id,
+                include_images=False,
+            )
+            if candidate is None:
+                return
+            fallback_title = candidate.fallback_title
+            if fallback_title is None:
+                return
+            title_set = await asyncio.to_thread(
+                conversation_store.set_title_if_missing,
+                conv.id,
+                fallback_title,
+            )
+            if title_set:
+                conv.title = fallback_title
+        except Exception:  # noqa: BLE001 -- title persistence is best-effort
+            _logger.warning("Session fallback title persistence failed", exc_info=True)
         return
-    updated = await asyncio.to_thread(
-        conversation_store.update_conversation,
-        conv.id,
-        title=title,
+
+    if conv.id in _session_title_inflight_ids:
+        return
+    _session_title_inflight_ids.add(conv.id)
+
+    async def _refine_title() -> None:
+        try:
+            candidate = await asyncio.to_thread(
+                _first_title_candidate,
+                conversation_store,
+                conv.id,
+                include_images=True,
+            )
+            if candidate is None:
+                return
+            generated_title: str | None = None
+            for attempt in range(_SESSION_TITLE_GENERATION_ATTEMPTS):
+                persisted_conv = await asyncio.to_thread(
+                    conversation_store.get_conversation,
+                    conv.id,
+                )
+                if persisted_conv is None or persisted_conv.title is not None:
+                    return
+                try:
+                    generated_title = await generator.generate(
+                        candidate.prompt,
+                        candidate.attachments,
+                    )
+                except Exception:  # noqa: BLE001 -- naming is best-effort
+                    _logger.warning(
+                        "Session title generation attempt %d failed",
+                        attempt + 1,
+                        exc_info=True,
+                    )
+                if generated_title is not None:
+                    break
+                if attempt + 1 < _SESSION_TITLE_GENERATION_ATTEMPTS:
+                    await asyncio.sleep(_SESSION_TITLE_RETRY_DELAY_SECONDS)
+
+            title = generated_title or candidate.fallback_title
+            if title is None:
+                return
+            title_set = await asyncio.to_thread(
+                conversation_store.set_title_if_missing,
+                conv.id,
+                title,
+            )
+            if title_set:
+                conv.title = title
+        except Exception:  # noqa: BLE001 -- title refinement is best-effort
+            _logger.warning("Session title persistence failed", exc_info=True)
+
+    task = asyncio.create_task(
+        _refine_title(),
+        name=f"session-title-{conv.id}",
     )
-    if updated is not None:
-        conv.title = updated.title
+    _session_title_tasks.add(task)
+
+    def _title_task_done(done: asyncio.Task[None]) -> None:
+        _session_title_tasks.discard(done)
+        _session_title_inflight_ids.discard(conv.id)
+
+    task.add_done_callback(_title_task_done)
 
 
 async def _seed_missing_title_from_user_message(
@@ -9193,7 +9424,8 @@ async def _seed_missing_title_from_user_message(
     :param conversation_store: Store used to persist the title.
     :returns: None.
     """
-    await _seed_missing_title(conv, _title_content_from_item(item), conversation_store)
+    if _is_title_source_item(item):
+        await _seed_missing_title(conv, conversation_store)
 
 
 async def _persist_session_event(
@@ -13263,6 +13495,7 @@ async def _create_session_from_existing_agent(
                 for item in body.initial_items
             ]
             await asyncio.to_thread(conversation_store.append, conv.id, new_items)
+            await _seed_missing_title(conv, conversation_store)
         else:
             await _ensure_runner_relay_ready(
                 conv.id,

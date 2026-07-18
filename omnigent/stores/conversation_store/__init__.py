@@ -746,6 +746,21 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def set_title_if_missing(
+        self,
+        conversation_id: str,
+        title: str,
+    ) -> bool:
+        """
+        Atomically set a conversation title when it is still untitled.
+
+        :param conversation_id: Unique conversation identifier.
+        :param title: Initial title.
+        :returns: ``True`` when the title was set, otherwise ``False``.
+        """
+        ...
+
+    @abstractmethod
     def set_labels(
         self,
         conversation_id: str,

@@ -2567,6 +2567,24 @@ class SqlAlchemyConversationStore(ConversationStore):
                 meta.terminal_launch_args = json.dumps(terminal_launch_args)
         return self.get_conversation(conversation_id)
 
+    def set_title_if_missing(
+        self,
+        conversation_id: str,
+        title: str,
+    ) -> bool:
+        """Atomically set the title only while the conversation is untitled."""
+        with self._conv_session() as session:
+            result = session.execute(
+                update(SqlConversation)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id == conversation_id,
+                    SqlConversation.title == "",
+                )
+                .values(title=title, updated_at=now_epoch())
+            )
+            return int(getattr(result, "rowcount", 0)) == 1
+
     def set_runner_id(self, conversation_id: str, runner_id: str) -> bool:
         """
         Pin a conversation to a runner via atomic

@@ -23,6 +23,7 @@ import pytest
 
 from omnigent.llms.context_window import ModelPricing
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
+from omnigent.server.routes import sessions as sessions_module
 from omnigent.spec.types import SkillSpec
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -137,6 +138,26 @@ async def test_create_session_without_title_returns_none(
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     assert session["title"] is None
+
+
+async def test_history_only_initial_item_seeds_title(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unbound history seed receives the deterministic initial title."""
+
+    async def _no_runner(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _no_runner)
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        initial_message="Review the deployment architecture",
+    )
+
+    assert session["title"] == "Review the deployment architecture"
 
 
 # ── GET /v1/sessions (list) ──────────────────────────────
@@ -1069,13 +1090,8 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     assert published[0][1]["item"]["type"] == "slash_command"
     assert published[0][1]["item"]["id"] == visible["id"]
 
-    # The dispatch also seeds the sidebar title from the typed command,
-    # mirroring the plain-message path. Without it, a session whose FIRST
-    # message is a skill invocation (web landing composer, REPL) keeps a
-    # NULL title and the UI falls back to the conversation id. The title
-    # must come from the visible "/name args" text — the hidden meta
-    # item's SKILL.md blob leaking here would show skill instructions in
-    # the sidebar.
+    # Without a configured title model, the visible command supplies the
+    # original deterministic fallback title.
     session_resp = await client.get(f"/v1/sessions/{session['id']}")
     assert session_resp.status_code == 200, session_resp.text
     assert session_resp.json()["title"] == "/grill-me review this rollout"
@@ -6236,22 +6252,15 @@ async def test_post_external_conversation_item_auto_assigns_response_id(
     assert published[0][1]["type"] == "session.input.consumed"
 
 
-async def test_external_user_message_seeds_title_on_claude_native_session(
+async def test_external_user_message_uses_fallback_without_title_generator(
     client: httpx.AsyncClient,
 ) -> None:
     """
-    First forwarded user message seeds the title on a claude-native session.
+    A forwarded user message uses deterministic naming without a generator.
 
     With the placeholder carve-out removed, ``omnigent claude``
-    creates sessions without a title — same shape as every other
-    untitled session. The transcript forwarder's first
-    ``external_conversation_item`` user-message POST must trigger
-    the generic ``_seed_missing_title_from_user_message`` path and
-    populate the title with the standard first-60-char synthesis.
-    This pins the integration of that helper with the external-
-    conversation-item route for the claude-native label combination,
-    so a future refactor of either side can't silently break the
-    sidebar's first-message title for these sessions.
+    creates sessions without a title. Its first prompt must restore the original
+    prompt-derived naming behavior without making an LLM call.
     """
     agent = await create_test_agent(client)
     session = await _create_session(
@@ -6289,13 +6298,7 @@ async def test_external_user_message_seeds_title_on_claude_native_session(
 
     snap = await client.get(f"/v1/sessions/{session['id']}")
     assert snap.status_code == 200
-    # The synthesized title equals the first message when it already fits
-    # the first-60-char budget. If this is empty or unchanged from None,
-    # the generic seed path didn't fire on the external_conversation_item
-    # route for claude-native labels.
-    assert snap.json()["title"] == first_message, (
-        f"first user message did not seed the title; title={snap.json()['title']!r}"
-    )
+    assert snap.json()["title"] == first_message
 
 
 async def test_interrupt_on_claude_native_session_skips_idle_publish_on_runner_failure(

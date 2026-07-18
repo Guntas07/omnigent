@@ -287,6 +287,16 @@ def test_update_title(conversation_store: SqlAlchemyConversationStore) -> None:
     )
 
 
+def test_set_title_if_missing(conversation_store: SqlAlchemyConversationStore) -> None:
+    conv = conversation_store.create_conversation()
+
+    assert conversation_store.set_title_if_missing(conv.id, "Generated title")
+    assert conversation_store.get_conversation(conv.id).title == "Generated title"
+
+    assert not conversation_store.set_title_if_missing(conv.id, "Late generated title")
+    assert conversation_store.get_conversation(conv.id).title == "Generated title"
+
+
 def test_update_archived_round_trip(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

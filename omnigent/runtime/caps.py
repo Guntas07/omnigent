@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from omnigent.server.session_titles import SessionTitleGenerator
     from omnigent.server.smart_routing import RoutingClient
     from omnigent.spec.types import LLMConfig, PolicySpec
 
@@ -53,6 +54,11 @@ class RuntimeCaps:
         LLM call is billed to the request caller rather than a
         static service-level credential. ``None`` falls back to the
         ``llm``-config-resolved connection.
+    :param session_title_generator: Optional generator that asynchronously
+        fills an initially empty session title from its first user request.
+        A configured generator retries briefly, then uses deterministic naming
+        if generation does not return a title.
+        ``None`` uses the deterministic prompt-derived title directly.
     """
 
     execution_timeout: int = 7200
@@ -75,3 +81,6 @@ class RuntimeCaps:
     # Managed deployments can supply a different implementation (e.g.
     # a rules engine or remote service).  ``None`` disables routing.
     routing_client: RoutingClient | None = None
+    # Optional LLM-backed session naming. Kept pluggable so managed deployments
+    # can provide their own implementation without coupling routes to a provider.
+    session_title_generator: SessionTitleGenerator | None = None

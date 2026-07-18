@@ -61,6 +61,7 @@ import {
   useSensors,
 } from "@dnd-kit/core";
 import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
+import { AnimatedSessionTitle } from "./AnimatedSessionTitle";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -142,7 +143,6 @@ import {
   type ActiveChatOverride,
   COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY,
   computeNextActiveOverride,
-  conversationDisplayLabel,
   dedupeConversationsById,
   EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
   migratePinnedConversationIds,
@@ -2474,7 +2474,7 @@ function ConversationRow({
   // native `title` tooltip.
   const projectFlyoutName = !isMobile && isPinned ? currentProject : null;
 
-  const label = conversationDisplayLabel(conversation);
+  const label = conversation.title || "New Chat";
   // Recompute unseen state the moment the last-seen map changes (e.g. the
   // user picks "Mark as unread" on this row) rather than waiting for the
   // next conversations poll.
@@ -2681,6 +2681,7 @@ function ConversationRow({
   const rowLink = (
     <Link
       to={selectionMode ? "#" : `/c/${conversation.id}`}
+      aria-label={`${label}${hasUnseenMessages ? " (unread)" : ""}`}
       className={cn(
         "relative flex w-full flex-col gap-0.5 rounded-md px-2 py-2 text-left text-sm hover:bg-muted",
         !selectionMode && (sessionState?.kind === "awaiting" ? "pr-48 md:pr-29" : "pr-28 md:pr-16"),
@@ -2710,7 +2711,7 @@ function ConversationRow({
       }}
       // The rich project flyout replaces the native tooltip on pinned,
       // project-owned rows so the two don't stack; other rows keep it.
-      title={projectFlyoutName ? undefined : (conversation.title ?? conversation.id)}
+      title={projectFlyoutName ? undefined : label}
     >
       {/* Row 1: the session name. Status markers (working, needs-approval,
           unseen) render in the trailing time-marker slot below, replacing
@@ -2718,8 +2719,8 @@ function ConversationRow({
           shared) were removed to keep rows text-clean; pinned rows still
           group under "Pinned". */}
       <div className="flex w-full items-center gap-1.5">
-        <span className="relative min-w-0 truncate">
-          {label}
+        <span className="relative flex h-5 min-w-0 flex-1 items-center truncate">
+          <AnimatedSessionTitle title={conversation.title} fallback="New Chat" />
           {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
         </span>
       </div>

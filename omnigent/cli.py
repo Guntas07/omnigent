@@ -3240,12 +3240,14 @@ def server(
 
     server_llm = parse_server_llm(cfg.get("llm"))
 
-    # Build the default LLM-based routing client when BOTH the server
-    # has an ``llm:`` config AND the feature is explicitly enabled via
-    # OMNIGENT_SMART_ROUTING=1.  Hidden by default — managed deployments
-    # override RuntimeCaps.routing_client with their own implementation.
+    # A configured server LLM generates session titles by default. Operators
+    # can explicitly restore deterministic prompt-derived naming with
+    # ``OMNIGENT_SESSION_TITLES=0``. Smart routing remains opt-in.
+    title_generation_enabled = os.environ.get("OMNIGENT_SESSION_TITLES", "1") == "1"
+    smart_routing_enabled = os.environ.get("OMNIGENT_SMART_ROUTING") == "1"
     routing_client = None
-    if server_llm is not None and os.environ.get("OMNIGENT_SMART_ROUTING") == "1":
+    session_title_generator = None
+    if server_llm is not None and (title_generation_enabled or smart_routing_enabled):
         from omnigent.runtime.policies.builder import (
             _build_policy_llm_client,
             _resolve_server_llm_connection,
@@ -3254,15 +3256,21 @@ def server(
         _conn = _resolve_server_llm_connection(server_llm)
         _policy_client = _build_policy_llm_client(server_llm, _conn)
         if _policy_client is not None:
-            from omnigent.server.smart_routing import LLMRoutingClient
+            if title_generation_enabled:
+                from omnigent.server.session_titles import LLMSessionTitleGenerator
 
-            routing_client = LLMRoutingClient(_policy_client)
+                session_title_generator = LLMSessionTitleGenerator(_policy_client)
+            if smart_routing_enabled:
+                from omnigent.server.smart_routing import LLMRoutingClient
+
+                routing_client = LLMRoutingClient(_policy_client)
 
     caps = RuntimeCaps(
         execution_timeout=int(effective_timeout),
         default_policies=parse_default_policies(cfg.get("policies")),
         llm=server_llm,
         routing_client=routing_client,
+        session_title_generator=session_title_generator,
     )
     init_runtime(
         conversation_store=conversation_store,

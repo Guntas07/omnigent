@@ -13,11 +13,19 @@ import pytest
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
+from omnigent.entities import (
+    DEFAULT_ENVIRONMENT_ID,
+    Conversation,
+    ConversationItem,
+    MessageData,
+    NewConversationItem,
+    PagedList,
+)
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import _globals, session_stream, set_runner_client, set_runner_router
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
+from omnigent.stores.conversation_store import ConversationStore
 
 
 class _ConversationStore:
@@ -3656,12 +3664,29 @@ async def test_kiro_native_dispatch_clears_pending_when_injection_fails() -> Non
 
 
 @pytest.mark.asyncio
-async def test_kiro_external_prompt_matches_pending_and_reports_skipped_input() -> None:
+async def test_kiro_external_prompt_matches_pending_and_reports_skipped_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A failed Kiro prompt must not make the next prompt clear the wrong pending input."""
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes.sessions import _persist_external_conversation_item
 
     pending_inputs.reset_for_tests()
+    seeded_prompts: list[str] = []
+
+    async def _record_title_seed(
+        conv: Conversation,
+        item: NewConversationItem,
+        conversation_store: ConversationStore,
+    ) -> None:
+        del conv, conversation_store
+        if isinstance(item.data, MessageData):
+            seeded_prompts.append(item.data.content[0]["text"])
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._seed_missing_title_from_user_message",
+        _record_title_seed,
+    )
     store = _ConversationStore()
     conv = store.get_conversation("823dbd1aab969b5a813fac59bb977a77")
     assert conv is not None
@@ -3706,6 +3731,7 @@ async def test_kiro_external_prompt_matches_pending_and_reports_skipped_input() 
         assert matched_user.data.role == "user"
         assert matched_user.data.content == [{"type": "input_text", "text": "tell me a joke"}]
         assert matched_user.created_by == "alice@example.com"
+        assert seeded_prompts == ["!!!! XOXOX !!!!", "tell me a joke"]
         assert first != second
     finally:
         pending_inputs.reset_for_tests()

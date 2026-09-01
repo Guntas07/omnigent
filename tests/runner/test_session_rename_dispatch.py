@@ -123,8 +123,13 @@ async def test_session_rename_refuses_child_sessions() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "info_payload",
-    [["unexpected"], {"id": "conv_current"}],
-    ids=["non-dict", "missing-parent-field"],
+    [
+        ["unexpected"],
+        {"id": "conv_current"},
+        {"id": "conv_current", "parent_session_id": ""},
+        {"id": "conv_current", "parent_session_id": 0},
+    ],
+    ids=["non-dict", "missing-parent-field", "empty-string-parent", "non-string-parent"],
 )
 async def test_session_rename_fails_closed_on_unverifiable_session(
     info_payload: object,

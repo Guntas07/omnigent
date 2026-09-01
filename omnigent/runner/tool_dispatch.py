@@ -4389,13 +4389,51 @@ async def _rename_current_session_via_rest(
     title = args.get("title")
     if not isinstance(title, str):
         return json.dumps({"error": "sys_session_rename requires a string 'title'"})
-    if len(title) < 2 or len(title) > 60:
-        return json.dumps({"error": "sys_session_rename title must be 2-60 characters"})
+    # Enforce exactly the bounds the tool schema advertises to the LLM, so the
+    # dispatcher can never drift from the published contract.
+    title_schema = SysSessionRenameTool().get_schema()["function"]["parameters"]["properties"][
+        "title"
+    ]
+    max_chars = title_schema["maxLength"]
+    if len(title) < 2 or len(title) > max_chars:
+        return json.dumps({"error": f"sys_session_rename title must be 2-{max_chars} characters"})
     if "\n" in title or "\r" in title:
         return json.dumps({"error": "sys_session_rename title must be a single line"})
     normalized_title = " ".join(title.split())
     if len(normalized_title) < 2:
-        return json.dumps({"error": "sys_session_rename title must be 2-60 characters"})
+        return json.dumps({"error": f"sys_session_rename title must be 2-{max_chars} characters"})
+    # Only a top-level session may rename itself: a sub-agent's title is its
+    # (parent, title) continuation address for sys_session_send, so a child
+    # rename would corrupt sibling addressing. Refuse explicitly, matching
+    # the old seed-gated endpoint's response for child sessions.
+    try:
+        info_response = await server_client.get(
+            f"/v1/sessions/{conversation_id}",
+            params={"include_items": "false"},
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_session_rename failed: {exc}"})
+    if info_response.status_code >= 400:
+        return json.dumps(
+            {
+                "error": f"sys_session_rename returned {info_response.status_code}",
+                "detail": info_response.text[:200],
+            }
+        )
+    try:
+        info_payload = info_response.json()
+    except ValueError as exc:
+        return json.dumps({"error": f"sys_session_rename returned invalid JSON: {exc}"})
+    # Fail closed: only a payload that positively shows a parentless session
+    # may proceed — a malformed or version-skewed snapshot must not let a
+    # child rename slip through and corrupt its continuation address.
+    if not isinstance(info_payload, dict) or "parent_session_id" not in info_payload:
+        return json.dumps(
+            {"error": "sys_session_rename could not verify the session is top-level"}
+        )
+    if info_payload.get("parent_session_id"):
+        return json.dumps({"renamed": False, "title": None, "reason": "not_top_level"})
     try:
         response = await server_client.patch(
             f"/v1/sessions/{conversation_id}",

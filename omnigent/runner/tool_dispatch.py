@@ -4409,7 +4409,9 @@ async def _rename_current_session_via_rest(
     try:
         info_response = await server_client.get(
             f"/v1/sessions/{conversation_id}",
-            params={"include_items": "false"},
+            # Skip the transcript and the runner/host liveness lookup — the
+            # probe only needs parent_session_id.
+            params={"include_items": "false", "include_liveness": "false"},
             timeout=30.0,
         )
     except Exception as exc:  # noqa: BLE001
